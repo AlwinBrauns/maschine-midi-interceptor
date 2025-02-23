@@ -5,6 +5,12 @@ import threading
 import time
 from collections import defaultdict
 
+DEBUG_ENABLED = True
+
+def debug_print(*args, **kwargs):
+    if DEBUG_ENABLED:
+        print(*args, **kwargs)
+
 mido.set_backend('mido.backends.rtmidi')
 midi_out = None
 note_state = defaultdict(lambda: "none")
@@ -13,34 +19,60 @@ class MidiSelectorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MIDI Aftertouch -> Note-On Converter")
-        self.geometry("400x450")
+        self.geometry("400x500")
         self.midi_thread = None
         self.stop_event = threading.Event()
         self.pass_polytouch_var = tk.BooleanVar(value=False)
         self.create_widgets()
+
     def create_widgets(self):
         midi_in_devices = mido.get_input_names() or ["No Input Devices Found"]
         midi_out_devices = mido.get_output_names() or ["No Output Devices Found"]
+
         tk.Label(self, text="Select MIDI Input Device:").pack(pady=5)
         self.combo_in = ttk.Combobox(self, values=midi_in_devices)
         self.combo_in.pack(pady=5)
         if midi_in_devices and midi_in_devices[0] != "No Input Devices Found":
             self.combo_in.current(0)
+
         tk.Label(self, text="Select MIDI Output Device:").pack(pady=5)
         self.combo_out = ttk.Combobox(self, values=midi_out_devices)
         self.combo_out.pack(pady=5)
         if midi_out_devices and midi_out_devices[0] != "No Output Devices Found":
             self.combo_out.current(0)
-        self.check_polytouch = tk.Checkbutton(self, text="Pass polytouch for real/artificial notes", variable=self.pass_polytouch_var)
+
+        self.check_polytouch = tk.Checkbutton(
+            self,
+            text="Pass polytouch for real/artificial notes",
+            variable=self.pass_polytouch_var
+        )
         self.check_polytouch.pack(pady=5)
+
         tk.Label(self, text="Threshold:").pack(pady=5)
         self.threshold_var = tk.IntVar(value=10)
         self.slider_thresh = tk.Scale(self, variable=self.threshold_var, from_=1, to=20, orient=tk.HORIZONTAL)
         self.slider_thresh.pack(pady=5)
+
+        self.sleep_var = tk.IntVar(value=10)
+        self.sleep_slider = tk.Scale(self, variable=self.sleep_var, from_=1, to=100, orient=tk.HORIZONTAL, label="Sleep (ms)")
+        self.sleep_slider.pack(pady=5)
+
         self.start_button = tk.Button(self, text="Start", command=self.start_midi)
         self.start_button.pack(pady=10)
+
         self.stop_button = tk.Button(self, text="Stop", command=self.stop_midi, state=tk.DISABLED)
         self.stop_button.pack(pady=5)
+        
+        self.toggle_debug_button = tk.Button(self, text="Disable Debug Printing", command=self.toggle_debug)
+        self.toggle_debug_button.pack(pady=5)
+
+    def toggle_debug(self):
+        global DEBUG_ENABLED
+        DEBUG_ENABLED = not DEBUG_ENABLED
+        new_text = "Enable Debug Printing" if not DEBUG_ENABLED else "Disable Debug Printing"
+        self.toggle_debug_button.config(text=new_text)
+        debug_print("Debug printing toggled. Now:", DEBUG_ENABLED)
+
     def start_midi(self):
         in_device = self.combo_in.get()
         out_device = self.combo_out.get()
@@ -53,17 +85,24 @@ class MidiSelectorApp(tk.Tk):
         global midi_out
         try:
             midi_out = mido.open_output(out_device)
-            print(f"MIDI output opened: {out_device}")
+            debug_print(f"MIDI output opened: {out_device}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open MIDI output: {e}")
             return
         self.stop_event.clear()
-        self.midi_thread = threading.Thread(target=midi_loop, args=(in_device, self.stop_event, self.pass_polytouch_var, self.threshold_var))
+        self.midi_thread = threading.Thread(target=midi_loop, args=(
+            in_device,
+            self.stop_event,
+            self.pass_polytouch_var,
+            self.threshold_var,
+            self.sleep_var
+        ))
         self.midi_thread.daemon = True
         self.midi_thread.start()
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
-        print(f"Starting MIDI loop with input device: {in_device}")
+        debug_print(f"Starting MIDI loop with input device: {in_device}")
+
     def stop_midi(self):
         self.stop_event.set()
         if self.midi_thread is not None:
@@ -74,21 +113,24 @@ class MidiSelectorApp(tk.Tk):
         if midi_out:
             midi_out.close()
             midi_out = None
-        print("MIDI loop stopped.")
+        debug_print("MIDI loop stopped.")
+
     def on_close(self):
         self.stop_midi()
         self.destroy()
 
 def handle_message(msg, pass_polytouch_var, threshold_var):
-    print(f"Incoming: {msg}")
-    if msg.type == 'note_on' and msg.velocity > 0:
+    debug_print(f"Incoming: {msg}")
+    # Pass real note on/off messages through
+    if msg.type == 'note_on':
         note_state[msg.note] = "real"
         if midi_out:
             midi_out.send(msg)
-    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+    elif msg.type == 'note_off':
         note_state[msg.note] = "none"
         if midi_out:
             midi_out.send(msg)
+    # Handle polytouch messages
     elif msg.type == 'polytouch':
         current_state = note_state[msg.note]
         channel = getattr(msg, 'channel', 0)
@@ -97,39 +139,42 @@ def handle_message(msg, pass_polytouch_var, threshold_var):
                 note_state[msg.note] = "artificial"
                 velocity_for_artificial = min(127, msg.value)
                 artificial_on = mido.Message('note_on', note=msg.note, velocity=velocity_for_artificial, channel=channel)
-                print(f"Artificial Note-On: {artificial_on}")
+                debug_print(f"Artificial Note-On: {artificial_on}")
                 if midi_out:
                     midi_out.send(artificial_on)
         elif current_state == "artificial":
-            if pass_polytouch_var.get():
+            if msg.value < threshold_var.get():
+                note_state[msg.note] = "none"
+                artificial_off = mido.Message('note_off', note=msg.note, velocity=0, channel=channel)
+                debug_print(f"Artificial Note-Off: {artificial_off}")
+                if midi_out:
+                    midi_out.send(artificial_off)
+            else:
                 if midi_out:
                     midi_out.send(msg)
-                print(f"Passing polytouch for artificial note {msg.note} (value={msg.value})")
-            else:
-                if msg.value < threshold_var.get():
-                    note_state[msg.note] = "none"
-                    artificial_off = mido.Message('note_off', note=msg.note, velocity=0, channel=channel)
-                    print(f"Artificial Note-Off: {artificial_off}")
-                    if midi_out:
-                        midi_out.send(artificial_off)
+                debug_print(f"Passing polytouch for artificial note {msg.note} (value={msg.value})")
         elif current_state == "real":
             if pass_polytouch_var.get():
                 if midi_out:
                     midi_out.send(msg)
-                print(f"Passing polytouch for real note {msg.note} (value={msg.value})")
+                debug_print(f"Passing polytouch for real note {msg.note} (value={msg.value})")
             else:
-                print(f"Ignoring polytouch for real note {msg.note}")
+                debug_print(f"Ignoring polytouch for real note {msg.note}")
+    else:
+        if midi_out:
+            midi_out.send(msg)
+        debug_print(f"Passing through other MIDI message: {msg}")
 
-def midi_loop(inport_name, stop_event, pass_polytouch_var, threshold_var):
+def midi_loop(inport_name, stop_event, pass_polytouch_var, threshold_var, sleep_var):
     try:
         with mido.open_input(inport_name) as inport:
-            print("MIDI input opened:", inport_name)
+            debug_print("MIDI input opened:", inport_name)
             while not stop_event.is_set():
                 for msg in inport.iter_pending():
                     handle_message(msg, pass_polytouch_var, threshold_var)
-                time.sleep(0.01)
+                time.sleep(sleep_var.get() / 1000.0)
     except Exception as e:
-        print("Error in MIDI loop:", e)
+        debug_print("Error in MIDI loop:", e)
 
 if __name__ == '__main__':
     app = MidiSelectorApp()
