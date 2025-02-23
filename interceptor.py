@@ -21,7 +21,7 @@ def handle_polytouch_bounce(msg, threshold):
     channel = getattr(msg, 'channel', 0)
     buffers = bounce_buffers[msg.note]
 
-    if current_state != "none":
+    if note_state[msg.note] != "none":
         if len(buffers["off"]) < 4:
             buffers["off"].append(msg.value)
         if len(buffers["off"]) == 4:
@@ -54,18 +54,18 @@ def handle_polytouch_bounce(msg, threshold):
 
 def handle_message(msg, pass_polytouch_var, threshold_var, bounce_retrigger_var):
     debug_print(f"Incoming: {msg}")
-    if msg.type == 'note_on':
+    if msg.type == 'note_on' and msg.velocity > 0:
+        bounce_buffers[msg.note]["off"].clear()
+        bounce_buffers[msg.note]["on"].clear()
         note_state[msg.note] = "real"
         if midi_out:
             midi_out.send(msg)
+    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
         bounce_buffers[msg.note]["off"].clear()
         bounce_buffers[msg.note]["on"].clear()
-    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
         note_state[msg.note] = "none"
         if midi_out:
             midi_out.send(msg)
-        bounce_buffers[msg.note]["off"].clear()
-        bounce_buffers[msg.note]["on"].clear()
     elif msg.type == 'polytouch':
         if bounce_retrigger_var.get():
             if handle_polytouch_bounce(msg, threshold_var.get()):
@@ -75,7 +75,8 @@ def handle_message(msg, pass_polytouch_var, threshold_var, bounce_retrigger_var)
         if current_state == "none":
             if msg.value > threshold_var.get():
                 note_state[msg.note] = "artificial"
-                artificial_on = mido.Message('note_on', note=msg.note, velocity=min(127, msg.value), channel=channel)
+                velocity_for_artificial = min(127, msg.value)
+                artificial_on = mido.Message('note_on', note=msg.note, velocity=velocity_for_artificial, channel=channel)
                 debug_print(f"Artificial Note-On: {artificial_on}")
                 bounce_buffers[msg.note]["off"].clear()
                 bounce_buffers[msg.note]["on"].clear()
