@@ -20,29 +20,22 @@ bounce_buffers = defaultdict(lambda: {"off": [], "on": []})
 def handle_polytouch_bounce(msg, threshold):
     channel = getattr(msg, 'channel', 0)
     buffers = bounce_buffers[msg.note]
-    
-    if note_state[msg.note] != "none":
+
+    if len(buffers["off"]) < 14:
         buffers["off"].append(msg.value)
-        if len(buffers["off"]) > 14:
-            buffers["off"].pop(0)
-        if len(buffers["off"]) == 14:
-            diff_sum = buffers["off"][-1] - buffers["off"][0]
-            debug_print(f"Off buffer diff for note {msg.note}: {diff_sum}")
-            if diff_sum < 0:
-                note_state[msg.note] = "none"
-                note_off_msg = mido.Message('note_off', note=msg.note, velocity=0, channel=channel)
-                debug_print(f"Bounce: Triggering note_off for note {msg.note}")
-                if midi_out:
-                    midi_out.send(note_off_msg)
-                    return True
-                buffers["off"].clear()
-                buffers["on"].clear()
-    else:
+    if len(buffers["off"]) == 14:
+        diff_sum = (buffers["off"][1] - buffers["off"][0]) + (buffers["off"][3] - buffers["off"][2]) + (buffers["off"][5] - buffers["off"][4]) + (buffers["off"][7] - buffers["off"][6]) + (buffers["off"][9] - buffers["off"][8]) + (buffers["off"][11] - buffers["off"][10]) + (buffers["off"][13] - buffers["off"][12])
+        debug_print(f"Off buffer diff for note {msg.note}: {diff_sum}")
+        if diff_sum < 0:
+            note_state[msg.note] = "none"
+            note_off_msg = mido.Message('note_off', note=msg.note, velocity=0, channel=channel)
+            debug_print(f"Bounce: Triggering note_off for note {msg.note}")
+            if midi_out:
+                midi_out.send(note_off_msg)
+                return True
         buffers["on"].append(msg.value)
-        if len(buffers["on"]) > 4:
-            buffers["on"].pop(0)
         if len(buffers["on"]) == 4:
-            diff_sum = buffers["on"][-1] - buffers["on"][0]
+            diff_sum = (buffers["on"][1] - buffers["on"][0]) + (buffers["on"][3] - buffers["on"][2]) 
             debug_print(f"On buffer diff for note {msg.note}: {diff_sum}")
             if diff_sum > 0:
                 note_state[msg.note] = "artificial"
@@ -51,8 +44,8 @@ def handle_polytouch_bounce(msg, threshold):
                 if midi_out:
                     midi_out.send(note_on_msg)
                     return True
-                buffers["off"].clear()
-                buffers["on"].clear()
+            buffers["off"].clear()
+            buffers["on"].clear()
     return False
 
 def handle_message(msg, pass_polytouch_var, threshold_var, bounce_retrigger_var):
@@ -70,10 +63,8 @@ def handle_message(msg, pass_polytouch_var, threshold_var, bounce_retrigger_var)
         bounce_buffers[msg.note]["off"].clear()
         bounce_buffers[msg.note]["on"].clear()
     elif msg.type == 'polytouch':
-        bounce_retrigger_happend = False
         if bounce_retrigger_var.get():
-            bounce_retrigger_happend = handle_polytouch_bounce(msg, threshold_var.get())
-            if bounce_retrigger_happend:
+            if handle_polytouch_bounce(msg, threshold_var.get()):
                 return
         current_state = note_state[msg.note]
         channel = getattr(msg, 'channel', 0)
@@ -82,6 +73,8 @@ def handle_message(msg, pass_polytouch_var, threshold_var, bounce_retrigger_var)
                 note_state[msg.note] = "artificial"
                 artificial_on = mido.Message('note_on', note=msg.note, velocity=min(127, msg.value), channel=channel)
                 debug_print(f"Artificial Note-On: {artificial_on}")
+                bounce_buffers[msg.note]["off"].clear()
+                bounce_buffers[msg.note]["on"].clear()
                 if midi_out:
                     midi_out.send(artificial_on)
         elif current_state == "artificial":
@@ -89,6 +82,8 @@ def handle_message(msg, pass_polytouch_var, threshold_var, bounce_retrigger_var)
                 note_state[msg.note] = "none"
                 artificial_off = mido.Message('note_off', note=msg.note, velocity=0, channel=channel)
                 debug_print(f"Artificial Note-Off: {artificial_off}")
+                bounce_buffers[msg.note]["off"].clear()
+                bounce_buffers[msg.note]["on"].clear()
                 if midi_out:
                     midi_out.send(artificial_off)
             else:
