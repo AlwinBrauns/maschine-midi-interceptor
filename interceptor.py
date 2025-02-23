@@ -13,16 +13,120 @@ def debug_print(*args, **kwargs):
 
 mido.set_backend('mido.backends.rtmidi')
 midi_out = None
+
 note_state = defaultdict(lambda: "none")
+bounce_buffers = defaultdict(lambda: {"off": [], "on": []})
+
+def handle_polytouch_bounce(msg, threshold):
+    channel = getattr(msg, 'channel', 0)
+    buffers = bounce_buffers[msg.note]
+    
+    if note_state[msg.note] != "none":
+        buffers["off"].append(msg.value)
+        if len(buffers["off"]) > 14:
+            buffers["off"].pop(0)
+        if len(buffers["off"]) == 14:
+            diff_sum = buffers["off"][-1] - buffers["off"][0]
+            debug_print(f"Off buffer diff for note {msg.note}: {diff_sum}")
+            if diff_sum < 0:
+                note_state[msg.note] = "none"
+                note_off_msg = mido.Message('note_off', note=msg.note, velocity=0, channel=channel)
+                debug_print(f"Bounce: Triggering note_off for note {msg.note}")
+                if midi_out:
+                    midi_out.send(note_off_msg)
+                    return True
+                buffers["off"].clear()
+                buffers["on"].clear()
+    else:
+        buffers["on"].append(msg.value)
+        if len(buffers["on"]) > 4:
+            buffers["on"].pop(0)
+        if len(buffers["on"]) == 4:
+            diff_sum = buffers["on"][-1] - buffers["on"][0]
+            debug_print(f"On buffer diff for note {msg.note}: {diff_sum}")
+            if diff_sum > 0:
+                note_state[msg.note] = "artificial"
+                note_on_msg = mido.Message('note_on', note=msg.note, velocity=min(127, msg.value), channel=channel)
+                debug_print(f"Bounce: Triggering note_on for note {msg.note}")
+                if midi_out:
+                    midi_out.send(note_on_msg)
+                    return True
+                buffers["off"].clear()
+                buffers["on"].clear()
+    return False
+
+def handle_message(msg, pass_polytouch_var, threshold_var, bounce_retrigger_var):
+    debug_print(f"Incoming: {msg}")
+    if msg.type == 'note_on':
+        note_state[msg.note] = "real"
+        if midi_out:
+            midi_out.send(msg)
+        bounce_buffers[msg.note]["off"].clear()
+        bounce_buffers[msg.note]["on"].clear()
+    elif msg.type == 'note_off':
+        note_state[msg.note] = "none"
+        if midi_out:
+            midi_out.send(msg)
+        bounce_buffers[msg.note]["off"].clear()
+        bounce_buffers[msg.note]["on"].clear()
+    elif msg.type == 'polytouch':
+        bounce_retrigger_happend = False
+        if bounce_retrigger_var.get():
+            bounce_retrigger_happend = handle_polytouch_bounce(msg, threshold_var.get())
+            if bounce_retrigger_happend:
+                return
+        current_state = note_state[msg.note]
+        channel = getattr(msg, 'channel', 0)
+        if current_state == "none":
+            if msg.value > threshold_var.get():
+                note_state[msg.note] = "artificial"
+                artificial_on = mido.Message('note_on', note=msg.note, velocity=min(127, msg.value), channel=channel)
+                debug_print(f"Artificial Note-On: {artificial_on}")
+                if midi_out:
+                    midi_out.send(artificial_on)
+        elif current_state == "artificial":
+            if msg.value < threshold_var.get():
+                note_state[msg.note] = "none"
+                artificial_off = mido.Message('note_off', note=msg.note, velocity=0, channel=channel)
+                debug_print(f"Artificial Note-Off: {artificial_off}")
+                if midi_out:
+                    midi_out.send(artificial_off)
+            else:
+                if midi_out:
+                    midi_out.send(msg)
+                debug_print(f"Passing polytouch for artificial note {msg.note} (value={msg.value})")
+        elif current_state == "real":
+            if pass_polytouch_var.get():
+                if midi_out:
+                    midi_out.send(msg)
+                debug_print(f"Passing polytouch for real note {msg.note} (value={msg.value})")
+            else:
+                debug_print(f"Ignoring polytouch for real note {msg.note}")
+    else:
+        if midi_out:
+            midi_out.send(msg)
+        debug_print(f"Passing through other MIDI message: {msg}")
+
+def midi_loop(inport_name, stop_event, pass_polytouch_var, threshold_var, sleep_var, bounce_retrigger_var):
+    try:
+        with mido.open_input(inport_name) as inport:
+            debug_print("MIDI input opened:", inport_name)
+            while not stop_event.is_set():
+                for msg in inport.iter_pending():
+                    handle_message(msg, pass_polytouch_var, threshold_var, bounce_retrigger_var)
+                time.sleep(sleep_var.get() / 1000.0)
+    except Exception as e:
+        debug_print("Error in MIDI loop:", e)
 
 class MidiSelectorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MIDI Aftertouch -> Note-On Converter")
-        self.geometry("400x500")
+        self.geometry("400x550")
         self.midi_thread = None
         self.stop_event = threading.Event()
         self.pass_polytouch_var = tk.BooleanVar(value=False)
+        self.bounce_retrigger_var = tk.BooleanVar(value=False)
         self.create_widgets()
 
     def create_widgets(self):
@@ -54,7 +158,7 @@ class MidiSelectorApp(tk.Tk):
         self.slider_thresh.pack(pady=5)
 
         self.sleep_var = tk.IntVar(value=10)
-        self.sleep_slider = tk.Scale(self, variable=self.sleep_var, from_=1, to=100, orient=tk.HORIZONTAL, label="Sleep (ms)")
+        self.sleep_slider = tk.Scale(self, variable=self.sleep_var, from_=1, to=10, orient=tk.HORIZONTAL, label="Reaction (ms)")
         self.sleep_slider.pack(pady=5)
 
         self.start_button = tk.Button(self, text="Start", command=self.start_midi)
@@ -66,12 +170,22 @@ class MidiSelectorApp(tk.Tk):
         self.toggle_debug_button = tk.Button(self, text="Disable Debug Printing", command=self.toggle_debug)
         self.toggle_debug_button.pack(pady=5)
 
+        self.toggle_bounce_button = tk.Button(self, text="Enable Bounce Retrigger", command=self.toggle_bounce)
+        self.toggle_bounce_button.pack(pady=5)
+
     def toggle_debug(self):
         global DEBUG_ENABLED
         DEBUG_ENABLED = not DEBUG_ENABLED
         new_text = "Enable Debug Printing" if not DEBUG_ENABLED else "Disable Debug Printing"
         self.toggle_debug_button.config(text=new_text)
         debug_print("Debug printing toggled. Now:", DEBUG_ENABLED)
+
+    def toggle_bounce(self):
+        current = self.bounce_retrigger_var.get()
+        self.bounce_retrigger_var.set(not current)
+        new_text = "Disable Bounce Retrigger" if self.bounce_retrigger_var.get() else "Enable Bounce Retrigger"
+        self.toggle_bounce_button.config(text=new_text)
+        debug_print("Bounce Retrigger toggled. Now:", self.bounce_retrigger_var.get())
 
     def start_midi(self):
         in_device = self.combo_in.get()
@@ -95,7 +209,8 @@ class MidiSelectorApp(tk.Tk):
             self.stop_event,
             self.pass_polytouch_var,
             self.threshold_var,
-            self.sleep_var
+            self.sleep_var,
+            self.bounce_retrigger_var
         ))
         self.midi_thread.daemon = True
         self.midi_thread.start()
@@ -118,63 +233,6 @@ class MidiSelectorApp(tk.Tk):
     def on_close(self):
         self.stop_midi()
         self.destroy()
-
-def handle_message(msg, pass_polytouch_var, threshold_var):
-    debug_print(f"Incoming: {msg}")
-    # Pass real note on/off messages through
-    if msg.type == 'note_on':
-        note_state[msg.note] = "real"
-        if midi_out:
-            midi_out.send(msg)
-    elif msg.type == 'note_off':
-        note_state[msg.note] = "none"
-        if midi_out:
-            midi_out.send(msg)
-    # Handle polytouch messages
-    elif msg.type == 'polytouch':
-        current_state = note_state[msg.note]
-        channel = getattr(msg, 'channel', 0)
-        if current_state == "none":
-            if msg.value > threshold_var.get():
-                note_state[msg.note] = "artificial"
-                velocity_for_artificial = min(127, msg.value)
-                artificial_on = mido.Message('note_on', note=msg.note, velocity=velocity_for_artificial, channel=channel)
-                debug_print(f"Artificial Note-On: {artificial_on}")
-                if midi_out:
-                    midi_out.send(artificial_on)
-        elif current_state == "artificial":
-            if msg.value < threshold_var.get():
-                note_state[msg.note] = "none"
-                artificial_off = mido.Message('note_off', note=msg.note, velocity=0, channel=channel)
-                debug_print(f"Artificial Note-Off: {artificial_off}")
-                if midi_out:
-                    midi_out.send(artificial_off)
-            else:
-                if midi_out:
-                    midi_out.send(msg)
-                debug_print(f"Passing polytouch for artificial note {msg.note} (value={msg.value})")
-        elif current_state == "real":
-            if pass_polytouch_var.get():
-                if midi_out:
-                    midi_out.send(msg)
-                debug_print(f"Passing polytouch for real note {msg.note} (value={msg.value})")
-            else:
-                debug_print(f"Ignoring polytouch for real note {msg.note}")
-    else:
-        if midi_out:
-            midi_out.send(msg)
-        debug_print(f"Passing through other MIDI message: {msg}")
-
-def midi_loop(inport_name, stop_event, pass_polytouch_var, threshold_var, sleep_var):
-    try:
-        with mido.open_input(inport_name) as inport:
-            debug_print("MIDI input opened:", inport_name)
-            while not stop_event.is_set():
-                for msg in inport.iter_pending():
-                    handle_message(msg, pass_polytouch_var, threshold_var)
-                time.sleep(sleep_var.get() / 1000.0)
-    except Exception as e:
-        debug_print("Error in MIDI loop:", e)
 
 if __name__ == '__main__':
     app = MidiSelectorApp()
